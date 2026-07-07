@@ -8,14 +8,14 @@
 # 1. 正式版本迭代时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 临时热修/不发版时只修改 SCRIPT_LAST_UPDATE，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.4.1 更新: 菜单33「端口流量计费与到期管理」菜单结构改为对齐 dog 原版分组(1添加/删除 2限制设置[带宽/配额/租期] 3重置管理[重置日/立即重置] 4通知 5诊断 99卸载)；修复主菜单0端口时状态栏"守护端口"数字重复显示的问题 (by Eric86777)
 # v5.4.0 更新: 精简 AI 代理工具箱(移除 Antigravity/OpenClaw/CLIProxyAPI/Codex Console/OAI2 共5个模块)；新增菜单33「端口流量计费与到期管理」(nftables计数/配额+tc限速+到期自动停机+可选Resend邮件通知) (by Eric86777)
 # v5.3.0 更新: Snell 主菜单(菜单12)进入时自动检查 v5/v6 有无新版本（每天联网一次+缓存秒回+并行探测+失败静默），结果显示在菜单顶部；v6 专区手动「检查更新」改为强制刷新 (by Eric86777)
 # v5.2.0 更新: Snell v6 专区新增「检查更新」(菜单 12-8-6)，探测官方有无比内置更新的 v6 版本并给出升级引导；官方无版本清单接口故用有限窗口递增探测 (by Eric86777)
 # v5.1.8 更新: Snell v6 默认内核 6.0.0b1 → 6.0.0b2（官方 b2 修复了 b1 的速度回退）；已装 v6 的机器跑「更新 v6 内核 + 一键修复」生效，客户端需对应支持 b2 的 Surge beta (by Eric86777)
-# v5.1.7 更新: 撤回 v5.1.6 的 tfo=true（实测部分线路 TCP Fast Open 兼容性差，导致首包卡顿/偶发掉线），节点行回退到仅 reuse=true (by Eric86777)
 
-SCRIPT_VERSION="5.4.0"
-SCRIPT_LAST_UPDATE="新增端口流量计费与到期管理(菜单33)；精简AI工具箱"
+SCRIPT_VERSION="5.4.1"
+SCRIPT_LAST_UPDATE="菜单33结构对齐dog原版；修复端口计数显示重复"
 #=============================================================================
 
 #=============================================================================
@@ -24108,12 +24108,21 @@ ptm_menu_add_port() {
     break_end
 }
 
-ptm_menu_list_ports() {
-    ptm_init_config
+ptm_get_daily_total_traffic() {
+    local total=0 port
+    for port in $(ptm_get_active_ports 2>/dev/null); do
+        total=$((total + $(ptm_get_port_monthly_usage "$port" 2>/dev/null || echo 0)))
+    done
+    echo "$total"
+}
+
+# 渲染端口状态表格（主菜单头部实时展示 + 独立"查看状态"菜单项共用）
+ptm_render_port_table() {
     local ports
     ports=$(ptm_get_active_ports)
     if [ -z "$ports" ]; then
-        echo -e "${gl_huang}暂无监控端口${gl_bai}"; break_end; return
+        echo -e "${gl_huang}暂无监控端口${gl_bai}"
+        return
     fi
     printf "%-20s %-10s %-10s %-16s %-18s %s\n" "端口" "计费模式" "状态" "已用流量" "配额" "到期日"
     local port
@@ -24126,19 +24135,16 @@ ptm_menu_list_ports() {
         usage=$(ptm_format_bytes "$(ptm_get_port_monthly_usage "$port")")
         printf "%-20s %-10s %-10s %-16s %-18s %s\n" "$port" "$billing_mode" "$status" "$usage" "$quota_limit" "$expire_date"
     done
+}
+
+ptm_menu_list_ports() {
+    ptm_init_config
+    ptm_render_port_table
     break_end
 }
 
-ptm_menu_renew() {
-    ptm_init_config
-    read -e -p "请输入要续费的端口: " port
-    if ! jq -e ".ports | has(\"$port\")" "$PTM_CONFIG_FILE" >/dev/null 2>&1; then
-        echo -e "${gl_hong}端口不存在${gl_bai}"; break_end; return
-    fi
-    read -e -p "续费月数: " months
-    if ! [[ "$months" =~ ^[0-9]+$ ]] || [ "$months" -le 0 ]; then
-        echo -e "${gl_hong}请输入正整数月数${gl_bai}"; break_end; return
-    fi
+ptm_do_renew_months() {
+    local port=$1 months=$2
     local current_expire today reset_day base_date
     current_expire=$(jq -r ".ports.\"$port\".expiration_date // \"\"" "$PTM_CONFIG_FILE")
     reset_day=$(jq -r ".ports.\"$port\".quota.reset_day // 1" "$PTM_CONFIG_FILE")
@@ -24153,60 +24159,141 @@ ptm_menu_renew() {
     fi
     local new_date
     new_date=$(ptm_calculate_next_expiration "$base_date" "$months" "${reset_day:-1}")
+    ptm_do_set_expiration "$port" "$new_date"
+}
+
+ptm_do_set_expiration() {
+    local port=$1 new_date=$2
     if [ -z "$new_date" ]; then
-        echo -e "${gl_hong}日期计算失败${gl_bai}"; break_end; return
+        echo -e "${gl_hong}日期计算失败${gl_bai}"; return 1
     fi
     if ! ptm_update_config ".ports.\"$port\".expiration_date = \"$new_date\""; then
-        echo -e "${gl_hong}续费写入失败，请重试${gl_bai}"; break_end; return
+        echo -e "${gl_hong}写入失败，请重试${gl_bai}"; return 1
     fi
     local saved_date
     saved_date=$(jq -r ".ports.\"$port\".expiration_date // \"\"" "$PTM_CONFIG_FILE")
     if [ "$saved_date" != "$new_date" ]; then
-        echo -e "${gl_hong}续费验证失败：期望 $new_date，实际 $saved_date${gl_bai}"; break_end; return
+        echo -e "${gl_hong}验证失败：期望 $new_date，实际 $saved_date${gl_bai}"; return 1
     fi
-    # 到期日延后，若端口此前处于到期封锁状态需要解封
+    # 到期日延后/清除，若端口此前处于到期封锁状态需要解封
     if [ "$(ptm_get_port_running_status "$port")" = "blocked_expired" ]; then
         ptm_unblock_port "$port"
     fi
-    echo -e "${gl_lv}✓ 续费成功，新到期日: $new_date${gl_bai}"
-    break_end
+    echo -e "${gl_lv}✓ 到期日已更新: $new_date${gl_bai}"
 }
 
-ptm_menu_edit_limit() {
+# 管理端口租期：续费预设月数 / 手动输入到期日 / 清除租期(设为永久)，对应 dog 原版"管理端口租期"子菜单
+ptm_menu_manage_lease() {
     ptm_init_config
-    read -e -p "请输入要修改的端口: " port
+    ptm_render_port_table
+    echo ""
+    read -e -p "请输入要管理租期的端口: " port
     if ! jq -e ".ports | has(\"$port\")" "$PTM_CONFIG_FILE" >/dev/null 2>&1; then
         echo -e "${gl_hong}端口不存在${gl_bai}"; break_end; return
     fi
-    read -e -p "新的月度流量配额 (如 100GB，输入 unlimited 为不限量，留空不改): " quota_input
-    if [ -n "$quota_input" ] && ! ptm_validate_quota "$quota_input"; then
-        echo -e "${gl_hong}格式不合法，只能是 unlimited 或 数字+MB/GB/TB（如 100GB），本次不修改配额${gl_bai}"
-        quota_input=""
-    fi
-    read -e -p "新的带宽限速 (如 100mbit，输入 unlimited 为不限速，留空不改): " rate_input
-    if [ -n "$rate_input" ] && ! ptm_validate_rate "$rate_input"; then
-        echo -e "${gl_hong}格式不合法，只能是数字+kbit/mbit/gbit（如 100mbit），本次不修改限速${gl_bai}"
-        rate_input=""
-    fi
+    local current_expire
+    current_expire=$(jq -r ".ports.\"$port\".expiration_date // \"永久\"" "$PTM_CONFIG_FILE")
+    echo "当前到期日: ${current_expire:-永久}"
+    echo "1. 续费 1 个月"
+    echo "2. 续费 3 个月 (季付)"
+    echo "3. 续费 6 个月 (半年)"
+    echo "4. 续费 1 年"
+    echo "5. 手动输入到期日期"
+    echo "6. 清除租期 (设置为永久)"
+    echo "0. 返回"
+    read -e -p "请选择 [0-6]: " choice
+    case "$choice" in
+        1) ptm_do_renew_months "$port" 1 ;;
+        2) ptm_do_renew_months "$port" 3 ;;
+        3) ptm_do_renew_months "$port" 6 ;;
+        4) ptm_do_renew_months "$port" 12 ;;
+        5)
+            read -e -p "请输入到期日期 (格式 YYYY-MM-DD): " manual_date
+            if ! date -d "$manual_date" >/dev/null 2>&1; then
+                echo -e "${gl_hong}日期格式不合法${gl_bai}"
+            else
+                ptm_do_set_expiration "$port" "$manual_date"
+            fi
+            ;;
+        6)
+            if ptm_update_config ".ports.\"$port\".expiration_date = \"\""; then
+                [ "$(ptm_get_port_running_status "$port")" = "blocked_expired" ] && ptm_unblock_port "$port"
+                echo -e "${gl_lv}✓ 已清除租期，端口恢复永久有效${gl_bai}"
+            fi
+            ;;
+        0) break_end; return ;;
+        *) echo -e "${gl_hong}无效选择${gl_bai}" ;;
+    esac
+    break_end
+}
 
-    if [ -n "$quota_input" ]; then
-        ptm_update_config ".ports.\"$port\".quota.monthly_limit = \"$quota_input\""
-        if [ "$quota_input" = "unlimited" ]; then
-            ptm_remove_quota "$port"
-        else
-            ptm_apply_quota "$port" "$quota_input"
-        fi
+ptm_menu_set_bandwidth() {
+    ptm_init_config
+    ptm_render_port_table
+    echo ""
+    read -e -p "请输入要设置带宽限速的端口: " port
+    if ! jq -e ".ports | has(\"$port\")" "$PTM_CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${gl_hong}端口不存在${gl_bai}"; break_end; return
     fi
-    if [ -n "$rate_input" ]; then
-        if [ "$rate_input" = "unlimited" ]; then
-            ptm_update_config ".ports.\"$port\".bandwidth_limit.enabled = false"
-            ptm_remove_tc_limit "$port"
-        else
-            ptm_update_config ".ports.\"$port\".bandwidth_limit.enabled = true | .ports.\"$port\".bandwidth_limit.rate = \"$rate_input\""
-            ptm_apply_tc_limit "$port" "$rate_input"
-        fi
+    while true; do
+        read -e -p "带宽限速 (如 100mbit，输入 unlimited 为不限速): " rate_input
+        [ -z "$rate_input" ] && { echo "已取消"; break_end; return; }
+        ptm_validate_rate "$rate_input" && break
+        echo -e "${gl_hong}格式不合法，只能是 unlimited 或 数字+kbit/mbit/gbit（如 100mbit）${gl_bai}"
+    done
+    if [ "$rate_input" = "unlimited" ]; then
+        ptm_update_config ".ports.\"$port\".bandwidth_limit.enabled = false"
+        ptm_remove_tc_limit "$port"
+    else
+        ptm_update_config ".ports.\"$port\".bandwidth_limit.enabled = true | .ports.\"$port\".bandwidth_limit.rate = \"$rate_input\""
+        ptm_apply_tc_limit "$port" "$rate_input"
     fi
-    echo -e "${gl_lv}✓ 修改完成${gl_bai}"
+    echo -e "${gl_lv}✓ 带宽限速已更新${gl_bai}"
+    break_end
+}
+
+ptm_menu_set_quota() {
+    ptm_init_config
+    ptm_render_port_table
+    echo ""
+    read -e -p "请输入要设置流量配额的端口: " port
+    if ! jq -e ".ports | has(\"$port\")" "$PTM_CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${gl_hong}端口不存在${gl_bai}"; break_end; return
+    fi
+    while true; do
+        read -e -p "月度流量配额 (如 100GB，输入 unlimited 为不限量): " quota_input
+        [ -z "$quota_input" ] && { echo "已取消"; break_end; return; }
+        ptm_validate_quota "$quota_input" && break
+        echo -e "${gl_hong}格式不合法，只能是 unlimited 或 数字+MB/GB/TB（如 100GB）${gl_bai}"
+    done
+    ptm_update_config ".ports.\"$port\".quota.monthly_limit = \"$quota_input\""
+    if [ "$quota_input" = "unlimited" ]; then
+        ptm_remove_quota "$port"
+    else
+        ptm_apply_quota "$port" "$quota_input"
+    fi
+    echo -e "${gl_lv}✓ 流量配额已更新${gl_bai}"
+    break_end
+}
+
+ptm_menu_set_reset_day() {
+    ptm_init_config
+    ptm_render_port_table
+    echo ""
+    read -e -p "请输入要设置重置日的端口: " port
+    if ! jq -e ".ports | has(\"$port\")" "$PTM_CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${gl_hong}端口不存在${gl_bai}"; break_end; return
+    fi
+    read -e -p "每月流量重置日 (1-28，留空则清除自动重置设置): " reset_day_input
+    if [ -z "$reset_day_input" ]; then
+        ptm_update_config "del(.ports.\"$port\".quota.reset_day) | del(.ports.\"$port\".quota.last_reset_cycle)"
+        echo -e "${gl_lv}✓ 已清除自动重置设置${gl_bai}"
+    elif ! [[ "$reset_day_input" =~ ^[0-9]+$ ]] || [ "$reset_day_input" -lt 1 ] || [ "$reset_day_input" -gt 28 ]; then
+        echo -e "${gl_hong}请输入 1-28 之间的整数${gl_bai}"
+    else
+        ptm_update_config ".ports.\"$port\".quota.reset_day = $reset_day_input"
+        echo -e "${gl_lv}✓ 重置日已设置为每月 $reset_day_input 号${gl_bai}"
+    fi
     break_end
 }
 
@@ -24313,7 +24400,7 @@ ptm_menu_diagnose() {
     if [ "$notify_enabled" = "true" ]; then
         echo -e "${gl_lv}✅ 邮件通知已配置${gl_bai}"
     else
-        echo -e "${gl_huang}⚠️ 邮件通知未配置（菜单 7 可配置，不配置则仅静默跳过通知）${gl_bai}"
+        echo -e "${gl_huang}⚠️ 邮件通知未配置（菜单 4 可配置，不配置则仅静默跳过通知）${gl_bai}"
     fi
     break_end
 }
@@ -24337,37 +24424,92 @@ ptm_menu_uninstall() {
     break_end
 }
 
+# 1. 添加/删除端口监控（对应 dog 原版 manage_port_monitoring）
+ptm_menu_port_monitoring() {
+    while true; do
+        clear
+        echo -e "${gl_kjlan}=== 添加/删除端口监控 ===${gl_bai}"
+        echo "1. 添加端口监控"
+        echo "2. 删除端口监控"
+        echo "0. 返回主菜单"
+        read -e -p "请选择操作 [0-2]: " choice
+        case "$choice" in
+            1) ptm_menu_add_port ;;
+            2) ptm_menu_remove_port ;;
+            0) return ;;
+            *) echo "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+# 2. 端口限制设置管理（对应 dog 原版 manage_traffic_limits）
+ptm_menu_limits() {
+    while true; do
+        clear
+        echo -e "${gl_kjlan}=== 端口限制设置管理 ===${gl_bai}"
+        echo "1. 设置端口带宽限制（速率控制）"
+        echo "2. 设置端口流量配额（总量控制）"
+        echo "3. 管理端口租期（自动到期停机）"
+        echo "0. 返回主菜单"
+        read -e -p "请选择操作 [0-3]: " choice
+        case "$choice" in
+            1) ptm_menu_set_bandwidth ;;
+            2) ptm_menu_set_quota ;;
+            3) ptm_menu_manage_lease ;;
+            0) return ;;
+            *) echo "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+# 3. 流量重置管理（对应 dog 原版 manage_traffic_reset）
+ptm_menu_reset_mgmt() {
+    while true; do
+        clear
+        echo -e "${gl_kjlan}=== 流量重置管理 ===${gl_bai}"
+        echo "1. 重置流量月重置日设置"
+        echo "2. 立即重置"
+        echo "0. 返回主菜单"
+        read -e -p "请选择操作 [0-2]: " choice
+        case "$choice" in
+            1) ptm_menu_set_reset_day ;;
+            2) ptm_menu_reset_now ;;
+            0) return ;;
+            *) echo "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+# 主菜单：结构对应 dog 原版 show_main_menu（银行1添加/删除、2限制设置、3重置管理、
+# 4通知管理、5配置检测、99卸载），去掉了 dog 原版里超出本次移植范围的
+# "4.一键导出/导入配置"(GitHub备份) 与 "7.扩展工具"(与流量计费无关的个人工具)
 ptm_menu() {
     ptm_init_config
     while true; do
         clear
+        local port_count daily_total
+        port_count=$(ptm_get_active_ports 2>/dev/null | grep -c .)
+        daily_total=$(ptm_format_bytes "$(ptm_get_daily_total_traffic)")
         echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
         echo -e "${gl_kjlan}  端口流量计费与到期管理${gl_bai}"
         echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
-        echo ""
-        echo "1. 添加端口监控"
-        echo "2. 查看所有端口状态"
-        echo "3. 续费 / 修改到期日"
-        echo "4. 修改配额 / 带宽限制"
-        echo "5. 立即手动重置流量"
-        echo "6. 删除端口监控"
-        echo "7. 邮件通知设置 (Resend)"
-        echo "8. 配置诊断 / 自愈检测"
-        echo "9. 完全卸载"
-        echo ""
-        echo "0. 返回主菜单"
+        echo -e "${gl_lv}状态: 监控中${gl_bai} | 守护端口: ${port_count}个 | ${gl_huang}端口总流量: ${daily_total}${gl_bai}"
+        echo "────────────────────────────────────────────────────────"
+        ptm_render_port_table
+        echo "────────────────────────────────────────────────────────"
+        echo "1. 添加/删除端口监控    2. 端口限制设置管理"
+        echo "3. 流量重置管理         4. 通知管理"
+        echo "5. 配置诊断"
+        echo "99. 卸载                0. 返回主菜单"
         echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
-        read -e -p "请选择操作 [0-9]: " choice
+        read -e -p "请选择操作 [0-5,99]: " choice
         case $choice in
-            1) ptm_menu_add_port ;;
-            2) ptm_menu_list_ports ;;
-            3) ptm_menu_renew ;;
-            4) ptm_menu_edit_limit ;;
-            5) ptm_menu_reset_now ;;
-            6) ptm_menu_remove_port ;;
-            7) ptm_menu_configure_notify ;;
-            8) ptm_menu_diagnose ;;
-            9) ptm_menu_uninstall ;;
+            1) ptm_menu_port_monitoring ;;
+            2) ptm_menu_limits ;;
+            3) ptm_menu_reset_mgmt ;;
+            4) ptm_menu_configure_notify ;;
+            5) ptm_menu_diagnose ;;
+            99) ptm_menu_uninstall ;;
             0) return ;;
             *) echo "无效选择"; sleep 1 ;;
         esac
