@@ -8,16 +8,22 @@
 # 1. 正式版本迭代时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 临时热修/不发版时只修改 SCRIPT_LAST_UPDATE，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.4.3 更新: 菜单33修复7项问题——①新增开机自动恢复(ptm-boot-restore.sh+systemd服务+流量快照)，
+#   重启后自动重建nftables计数/配额/tc限速并重新封锁到期端口(此前重启即失效)；②每日检查新增配额80%/95%阈值邮件通知(此前完全缺失)；
+#   ③新增到期前3天预警(此前完全缺失)；④超期≥3天端口改为cron自动完整清理并回收(此前仅记日志不清理)；
+#   ⑤tc_remove_limit改为按端口精确删除(此前用全量tc filter del会清空该网卡上所有端口的限速规则)；
+#   ⑥修正配额规则重复插入；⑦清理菜单33遗留死代码；
+#   ⑧修复Sub2API(菜单32)自定义端口显示错误——端口提取正则不匹配官方 Environment=SERVER_PORT= 格式，
+#   导致部署完成页/状态页恒显示默认8282、修改端口功能静默失效；现以systemd服务文件为准并自愈过期端口文件 (by Eric86777)
 # v5.4.2 更新: 菜单33「快速开通端口」重做为与私有dog原版一致的多步向导(端口→计费模式→配额→备注→重置日→租期→邮箱)，
 #   恢复"合并端口为组"功能；配额/带宽输入改为dog原版的"0=无限制"约定(单位MB/GB/T、Kbps/Mbps/Gbps)；
 #   修正计费模式选项编号(2=仅出站 3=CN Premium，此前编号反了)；带宽/配额/租期管理改为按序号多选端口 (by Eric86777)
 # v5.4.1 更新: 菜单33「端口流量计费与到期管理」菜单结构改为对齐 dog 原版分组(1添加/删除 2限制设置[带宽/配额/租期] 3重置管理[重置日/立即重置] 4通知 5诊断 99卸载)；修复主菜单0端口时状态栏"守护端口"数字重复显示的问题 (by Eric86777)
 # v5.4.0 更新: 精简 AI 代理工具箱(移除 Antigravity/OpenClaw/CLIProxyAPI/Codex Console/OAI2 共5个模块)；新增菜单33「端口流量计费与到期管理」(nftables计数/配额+tc限速+到期自动停机+可选Resend邮件通知) (by Eric86777)
 # v5.3.0 更新: Snell 主菜单(菜单12)进入时自动检查 v5/v6 有无新版本（每天联网一次+缓存秒回+并行探测+失败静默），结果显示在菜单顶部；v6 专区手动「检查更新」改为强制刷新 (by Eric86777)
-# v5.2.0 更新: Snell v6 专区新增「检查更新」(菜单 12-8-6)，探测官方有无比内置更新的 v6 版本并给出升级引导；官方无版本清单接口故用有限窗口递增探测 (by Eric86777)
 
-SCRIPT_VERSION="5.4.2"
-SCRIPT_LAST_UPDATE="快速开通端口向导对齐dog原版；恢复合并端口为组"
+SCRIPT_VERSION="5.4.3"
+SCRIPT_LAST_UPDATE="菜单33修复7项问题；Sub2API自定义端口显示恒为8282/改端口静默失效修复"
 #=============================================================================
 
 #=============================================================================
@@ -19929,9 +19935,11 @@ SUB2API_DEFAULT_PORT="8282"
 SUB2API_PORT_FILE="/etc/sub2api-port"
 SUB2API_INSTALL_SCRIPT="https://raw.githubusercontent.com/Wei-Shaw/sub2api/main/deploy/install.sh"
 
-# 获取当前配置的端口
+# 获取当前配置的端口（以 systemd 服务文件为准，端口文件兜底）
 sub2api_get_port() {
-    if [ -f "$SUB2API_PORT_FILE" ]; then
+    if [ -f "/etc/systemd/system/sub2api.service" ]; then
+        sub2api_extract_port
+    elif [ -f "$SUB2API_PORT_FILE" ]; then
         cat "$SUB2API_PORT_FILE"
     else
         echo "$SUB2API_DEFAULT_PORT"
@@ -19962,8 +19970,14 @@ sub2api_check_status() {
 sub2api_extract_port() {
     local service_file="/etc/systemd/system/sub2api.service"
     if [ -f "$service_file" ]; then
-        # 尝试从 ExecStart 行提取端口
-        local port=$(sed -nE 's/.*:([0-9]+).*/\1/p' "$service_file" 2>/dev/null | head -1)
+        # 官方安装脚本以 Environment=SERVER_PORT=xxxx 形式写入端口
+        local port=$(sed -nE 's/^Environment=SERVER_PORT=([0-9]+)[[:space:]]*$/\1/p' "$service_file" 2>/dev/null | head -1)
+        if [ -n "$port" ]; then
+            echo "$port"
+            return
+        fi
+        # 兼容旧格式：从 地址:端口 形式提取
+        port=$(sed -nE 's/.*:([0-9]+).*/\1/p' "$service_file" 2>/dev/null | head -1)
         if [ -n "$port" ]; then
             echo "$port"
             return
@@ -20269,8 +20283,10 @@ sub2api_change_port() {
     # 修改 systemd 服务文件中的端口
     local service_file="/etc/systemd/system/sub2api.service"
     if [ -f "$service_file" ]; then
-        sed -i "s/:${current_port}/:${new_port}/g" "$service_file"
-        sed -i "s/=${current_port}/=${new_port}/g" "$service_file"
+        # 官方格式：Environment=SERVER_PORT=xxxx
+        sed -i -E "s/^(Environment=SERVER_PORT=)[0-9]+[[:space:]]*$/\1${new_port}/" "$service_file"
+        # 兼容旧格式：地址:端口
+        sed -i "s/:${current_port}\b/:${new_port}/g" "$service_file"
     fi
 
     # 保存新端口
@@ -22934,6 +22950,9 @@ PTM_TABLE_FAMILY="inet"
 PTM_CONFIG_LOCK_FILE="/var/run/ptm-config.lock"
 PTM_DAILY_SCRIPT="/usr/local/bin/ptm-daily-check.sh"
 PTM_RESET_SCRIPT="/usr/local/bin/ptm-reset-check.sh"
+PTM_BOOT_RESTORE_SCRIPT="/usr/local/bin/ptm-boot-restore.sh"
+PTM_BOOT_RESTORE_SERVICE="/etc/systemd/system/ptm-boot-restore.service"
+PTM_TRAFFIC_SNAPSHOT="${PTM_CONFIG_DIR}/traffic_snapshot.json"
 PTM_EMAIL_MAX_RETRIES=2
 PTM_EMAIL_CONNECT_TIMEOUT=10
 PTM_EMAIL_MAX_TIMEOUT=30
@@ -23380,12 +23399,8 @@ ptm__apply_quota_rules_for_single_port() {
     local single_port=$1 quota_name=$2 billing_mode=$3
     if [ "$billing_mode" = "single" ]; then
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME output tcp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME output tcp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME output udp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME output udp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward tcp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward tcp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward udp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward udp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
     elif [ "$billing_mode" = "premium" ]; then
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME input tcp dport $single_port quota name "$quota_name" drop 2>/dev/null || true
@@ -23398,20 +23413,12 @@ ptm__apply_quota_rules_for_single_port() {
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward udp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
     else
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME input tcp dport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME input tcp dport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME input udp dport $single_port quota name "$quota_name" drop 2>/dev/null || true
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME input udp dport $single_port quota name "$quota_name" drop 2>/dev/null || true
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward tcp dport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward tcp dport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward udp dport $single_port quota name "$quota_name" drop 2>/dev/null || true
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward udp dport $single_port quota name "$quota_name" drop 2>/dev/null || true
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME output tcp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME output tcp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME output udp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME output udp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward tcp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward tcp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
-        nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward udp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
         nft insert rule $PTM_TABLE_FAMILY $PTM_TABLE_NAME forward udp sport $single_port quota name "$quota_name" drop 2>/dev/null || true
     fi
 }
@@ -23629,7 +23636,24 @@ ptm_remove_tc_limit() {
     local interface class_id
     interface=$(ptm_get_default_interface)
     class_id=$(ptm_generate_tc_class_id "$port")
-    tc filter del dev "$interface" 2>/dev/null || true
+
+    # 按端口精确删除对应 filter，绝不能用不带任何匹配条件的 "tc filter del dev $interface"，
+    # 那样会把该网卡上所有端口的限速 filter 一并清空（含其他仍在生效的端口）
+    if ptm_is_port_group "$port" || ptm_is_port_range "$port"; then
+        local mark_id
+        mark_id=$(ptm_generate_mark "$port")
+        tc filter del dev "$interface" protocol ip parent 1:0 prio 1 handle "$mark_id" fw 2>/dev/null || true
+    else
+        local filter_prio=$((port % 1000 + 1))
+        tc filter del dev "$interface" protocol ip parent 1:0 prio "$filter_prio" u32 \
+            match ip protocol 6 0xff match ip sport "$port" 0xffff 2>/dev/null || true
+        tc filter del dev "$interface" protocol ip parent 1:0 prio "$filter_prio" u32 \
+            match ip protocol 6 0xff match ip dport "$port" 0xffff 2>/dev/null || true
+        tc filter del dev "$interface" protocol ip parent 1:0 prio $((filter_prio + 1000)) u32 \
+            match ip protocol 17 0xff match ip sport "$port" 0xffff 2>/dev/null || true
+        tc filter del dev "$interface" protocol ip parent 1:0 prio $((filter_prio + 1000)) u32 \
+            match ip protocol 17 0xff match ip dport "$port" 0xffff 2>/dev/null || true
+    fi
     tc class del dev "$interface" classid "$class_id" 2>/dev/null || true
 }
 
@@ -23974,9 +23998,12 @@ ptm_install_cron() {
 # ptm 每日到期/配额检查 wrapper（由 net-tcp-tune 自动生成，请勿手动修改）
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CONFIG_FILE="${PTM_CONFIG_FILE}"
+CONFIG_DIR="${PTM_CONFIG_DIR}"
+RESET_HISTORY_LOG="${PTM_RESET_HISTORY_LOG}"
 TABLE_NAME="${PTM_TABLE_NAME}"
 FAMILY="${PTM_TABLE_FAMILY}"
 LOG_FILE="${PTM_NOTIFICATION_LOG}"
+SNAPSHOT_FILE="${PTM_TRAFFIC_SNAPSHOT}"
 LOCK_FILE="/tmp/net-tcp-tune-ptm-daily.lock"
 
 log() { mkdir -p "\$(dirname "\$LOG_FILE")"; echo "[\$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
@@ -23992,6 +24019,86 @@ send_email() {
     curl -s --max-time 20 -X POST "https://api.resend.com/emails" -H "Authorization: Bearer \$key" -H "Content-Type: application/json" -d "\$body" | grep -q '"id"'
 }
 
+update_json() {
+    local expr="\$1"
+    local tmp="\${CONFIG_FILE}.tmp"
+    jq "\$expr" "\$CONFIG_FILE" > "\$tmp" 2>/dev/null && [ -s "\$tmp" ] && mv "\$tmp" "\$CONFIG_FILE" || rm -f "\$tmp"
+}
+
+group_ports() {
+    local key="\$1"
+    if [[ "\$key" =~ , ]] && ! [[ "\$key" =~ ^[0-9]+-[0-9]+\$ ]]; then
+        echo "\$key" | tr ',' ' '
+    elif [[ "\$key" =~ ^[0-9]+-[0-9]+\$ ]]; then
+        seq "\${key%-*}" "\${key#*-}"
+    else
+        echo "\$key"
+    fi
+}
+
+# 完整清理超期端口（对应主脚本 ptm_cleanup_expired_port，cron里必须真正执行而不是只记日志跳过）
+cleanup_expired() {
+    local port="\$1" psafe admin remark backup
+    psafe=\$(echo "\$port" | tr ',-' '__')
+    admin=\$(jq -r '.notify.admin_email // ""' "\$CONFIG_FILE" 2>/dev/null)
+    remark=\$(jq -r ".ports.\\"\$port\\".remark // \\"\$port\\"" "\$CONFIG_FILE")
+    backup=\$(jq -c ".ports.\\"\$port\\"" "\$CONFIG_FILE" 2>/dev/null)
+    log "[自动清理-备份] 端口 \$port 清理前配置快照: \$backup"
+    log "[自动清理] 端口 \$port (\$remark) 过期超3天，开始自动清理"
+
+    local deleted=0
+    while true; do
+        local handle
+        handle=\$(nft -a list table \$FAMILY \$TABLE_NAME 2>/dev/null | grep -E "(tcp|udp).*(dport|sport).*port_\${psafe}_" | head -n1 | sed -n 's/.*# handle \\([0-9]\\+\\)\$/\\1/p')
+        [ -z "\$handle" ] && break
+        local ok=false chain
+        for chain in input output forward prerouting; do
+            if nft delete rule \$FAMILY \$TABLE_NAME \$chain handle \$handle 2>/dev/null; then ok=true; break; fi
+        done
+        [ "\$ok" = false ] && break
+        deleted=\$((deleted + 1))
+        [ "\$deleted" -ge 200 ] && break
+    done
+    nft delete counter \$FAMILY \$TABLE_NAME "port_\${psafe}_in" 2>/dev/null || true
+    nft delete counter \$FAMILY \$TABLE_NAME "port_\${psafe}_out" 2>/dev/null || true
+    nft delete quota \$FAMILY \$TABLE_NAME "port_\${psafe}_quota" 2>/dev/null || true
+    nft delete quota \$FAMILY \$TABLE_NAME "port_\${psafe}_block_quota" 2>/dev/null || true
+
+    local iface
+    iface=\$(ip route | grep default | awk '{print \$5}' | head -n1)
+    if [ -n "\$iface" ]; then
+        if [[ "\$port" =~ , ]] || [[ "\$port" =~ ^[0-9]+-[0-9]+\$ ]]; then
+            local mark_id
+            mark_id=\$(( \$(echo -n "\$psafe" | cksum | cut -d' ' -f1) % 65000 + 1000 ))
+            tc filter del dev "\$iface" protocol ip parent 1:0 prio 1 handle "\$mark_id" fw 2>/dev/null || true
+            tc class del dev "\$iface" classid "1:\$(printf '%x' \$((0x2000 + (mark_id % 4096))))" 2>/dev/null || true
+        else
+            local fprio=\$((port % 1000 + 1))
+            tc filter del dev "\$iface" protocol ip parent 1:0 prio "\$fprio" u32 match ip protocol 6 0xff match ip sport "\$port" 0xffff 2>/dev/null || true
+            tc filter del dev "\$iface" protocol ip parent 1:0 prio "\$fprio" u32 match ip protocol 6 0xff match ip dport "\$port" 0xffff 2>/dev/null || true
+            tc filter del dev "\$iface" protocol ip parent 1:0 prio \$((fprio + 1000)) u32 match ip protocol 17 0xff match ip sport "\$port" 0xffff 2>/dev/null || true
+            tc filter del dev "\$iface" protocol ip parent 1:0 prio \$((fprio + 1000)) u32 match ip protocol 17 0xff match ip dport "\$port" 0xffff 2>/dev/null || true
+            tc class del dev "\$iface" classid "1:\$(printf '%x' \$((0x1000 + port)))" 2>/dev/null || true
+        fi
+    fi
+
+    if command -v conntrack >/dev/null 2>&1; then
+        local p
+        for p in \$(group_ports "\$port"); do
+            conntrack -D -p tcp --dport "\$p" 2>/dev/null || true
+            conntrack -D -p udp --dport "\$p" 2>/dev/null || true
+        done
+    fi
+
+    update_json "del(.ports.\\"\$port\\")"
+    if [ -f "\$RESET_HISTORY_LOG" ]; then
+        grep -v "|\${port}|" "\$RESET_HISTORY_LOG" > "\${RESET_HISTORY_LOG}.tmp" 2>/dev/null || true
+        mv "\${RESET_HISTORY_LOG}.tmp" "\$RESET_HISTORY_LOG" 2>/dev/null || true
+    fi
+    [ -n "\$admin" ] && [ "\$admin" != "null" ] && send_email "[自动清理] 端口 \$port (\$remark) 已回收" "<p>端口 \$port (\$remark) 到期超3天，已自动清理监控。</p>" "\$admin"
+    log "[自动清理] 端口 \$port (\$remark) 清理完成"
+}
+
 check_all() {
     [ -f "\$CONFIG_FILE" ] || return 0
     local today today_epoch admin
@@ -24001,34 +24108,151 @@ check_all() {
     for port in \$(jq -r '.ports | keys[]' "\$CONFIG_FILE" 2>/dev/null); do
         local expire user_email expire_epoch
         expire=\$(jq -r ".ports.\\"\$port\\".expiration_date // \\"\\"" "\$CONFIG_FILE")
-        if [ -n "\$expire" ] && [ "\$expire" != "null" ]; then
-            user_email=\$(jq -r ".ports.\\"\$port\\".email // \\"\\"" "\$CONFIG_FILE")
-            expire_epoch=\$(date -d "\$expire" +%s 2>/dev/null || echo 0)
-            if [ "\$expire_epoch" -gt 0 ] && [ "\$today_epoch" -gt "\$expire_epoch" ]; then
-                local days=\$(( (today_epoch - expire_epoch) / 86400 ))
-                if [ "\$days" -ge 3 ]; then
-                    log "[自动清理] 端口 \$port 过期超3天，跳过（请通过 vps-tcp-tune 菜单33手动清理确认）"
-                    continue
+        [ -z "\$expire" ] || [ "\$expire" = "null" ] && continue
+        user_email=\$(jq -r ".ports.\\"\$port\\".email // \\"\\"" "\$CONFIG_FILE")
+        expire_epoch=\$(date -d "\$expire" +%s 2>/dev/null || echo 0)
+        [ "\$expire_epoch" -eq 0 ] && continue
+
+        # 到期前3天预警窗口，每个到期周期只发一次
+        local warning_epoch=\$((expire_epoch - 3 * 86400))
+        if [ "\$today_epoch" -ge "\$warning_epoch" ] && [ "\$today_epoch" -lt "\$expire_epoch" ]; then
+            local last_warn
+            last_warn=\$(jq -r ".ports.\\"\$port\\".last_warning_target_date // \\"\\"" "\$CONFIG_FILE")
+            if [ "\$last_warn" != "\$expire" ]; then
+                log "[租期预警] 端口 \$port 即将到期 (\$expire)"
+                if [ -n "\$user_email" ] && [ "\$user_email" != "null" ]; then
+                    if send_email "【租期提醒】端口 \$port 即将到期" "<p>您租用的端口 \$port 即将到期 (\$expire)，请及时续费。</p>" "\$user_email"; then
+                        update_json ".ports.\\"\$port\\".last_warning_target_date = \\"\$expire\\""
+                    fi
                 fi
-                log "[租期管理] 端口 \$port 已到期 (\$expire)，执行停机"
-                [ -n "\$user_email" ] && [ "\$user_email" != "null" ] && send_email "【服务暂停】端口 \$port 已到期停机" "<p>端口 \$port 已到期停机</p>" "\$user_email"
-                [ -n "\$admin" ] && [ "\$admin" != "null" ] && send_email "[到期封锁] 端口 \$port" "<p>端口 \$port 到期日 \$expire 已停机</p>" "\$admin"
-                nft delete quota \$FAMILY \$TABLE_NAME "port_\$(echo "\$port" | tr ',-' '__')_block_quota" 2>/dev/null || true
-                nft add quota \$FAMILY \$TABLE_NAME "port_\$(echo "\$port" | tr ',-' '__')_block_quota" { over 0 bytes\; } 2>/dev/null || true
-                local psafe=\$(echo "\$port" | tr ',-' '__')
-                nft insert rule \$FAMILY \$TABLE_NAME input tcp dport \$port quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
-                nft insert rule \$FAMILY \$TABLE_NAME input udp dport \$port quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
-                nft insert rule \$FAMILY \$TABLE_NAME output tcp sport \$port quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
-                nft insert rule \$FAMILY \$TABLE_NAME output udp sport \$port quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
+                [ -n "\$admin" ] && [ "\$admin" != "null" ] && send_email "[租期预警] 端口 \$port 即将到期" "<p>端口 \$port 到期日: \$expire</p>" "\$admin"
+            fi
+        fi
+
+        if [ "\$today_epoch" -gt "\$expire_epoch" ]; then
+            local days=\$(( (today_epoch - expire_epoch) / 86400 ))
+            if [ "\$days" -ge 3 ]; then
+                cleanup_expired "\$port"
+                continue
+            fi
+            log "[租期管理] 端口 \$port 已到期 (\$expire)，执行停机"
+            [ -n "\$user_email" ] && [ "\$user_email" != "null" ] && send_email "【服务暂停】端口 \$port 已到期停机" "<p>端口 \$port 已到期停机</p>" "\$user_email"
+            [ -n "\$admin" ] && [ "\$admin" != "null" ] && send_email "[到期封锁] 端口 \$port" "<p>端口 \$port 到期日 \$expire 已停机</p>" "\$admin"
+            local psafe=\$(echo "\$port" | tr ',-' '__')
+            nft delete quota \$FAMILY \$TABLE_NAME "port_\${psafe}_block_quota" 2>/dev/null || true
+            nft add quota \$FAMILY \$TABLE_NAME "port_\${psafe}_block_quota" { over 0 bytes\; } 2>/dev/null || true
+            nft insert rule \$FAMILY \$TABLE_NAME input tcp dport \$port quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
+            nft insert rule \$FAMILY \$TABLE_NAME input udp dport \$port quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
+            nft insert rule \$FAMILY \$TABLE_NAME output tcp sport \$port quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
+            nft insert rule \$FAMILY \$TABLE_NAME output udp sport \$port quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
+        fi
+    done
+}
+
+# 配额80%预警 / 95%(视为用尽)封锁通知，按计费周期去重
+check_quota() {
+    [ -f "\$CONFIG_FILE" ] || return 0
+    for port in \$(jq -r '.ports | keys[]' "\$CONFIG_FILE" 2>/dev/null); do
+        local enabled limit
+        enabled=\$(jq -r ".ports.\\"\$port\\".quota.enabled // true" "\$CONFIG_FILE")
+        limit=\$(jq -r ".ports.\\"\$port\\".quota.monthly_limit // \\"unlimited\\"" "\$CONFIG_FILE")
+        [ "\$enabled" != "true" ] || [ "\$limit" = "unlimited" ] && continue
+        local user_email
+        user_email=\$(jq -r ".ports.\\"\$port\\".email // \\"\\"" "\$CONFIG_FILE")
+        [ -z "\$user_email" ] || [ "\$user_email" = "null" ] && continue
+
+        local psafe number unit limit_bytes
+        psafe=\$(echo "\$port" | tr ',-' '__')
+        number=\$(echo "\$limit" | grep -o '^[0-9]\\+')
+        unit=\$(echo "\$limit" | grep -o '[A-Za-z]\\+\$' | tr '[:lower:]' '[:upper:]')
+        case "\$unit" in
+            MB|M) limit_bytes=\$((number * 1048576)) ;;
+            GB|G) limit_bytes=\$((number * 1073741824)) ;;
+            TB|T) limit_bytes=\$((number * 1099511627776)) ;;
+            *) limit_bytes=0 ;;
+        esac
+        [ "\$limit_bytes" -le 0 ] && continue
+
+        local in_b out_b mode usage
+        in_b=\$(nft list counter \$FAMILY \$TABLE_NAME "port_\${psafe}_in" 2>/dev/null | grep -o 'bytes [0-9]*' | awk '{print \$2}')
+        out_b=\$(nft list counter \$FAMILY \$TABLE_NAME "port_\${psafe}_out" 2>/dev/null | grep -o 'bytes [0-9]*' | awk '{print \$2}')
+        in_b=\${in_b:-0}; out_b=\${out_b:-0}
+        mode=\$(jq -r ".ports.\\"\$port\\".billing_mode // \\"double\\"" "\$CONFIG_FILE")
+        case "\$mode" in
+            premium) usage=\$((in_b + out_b)) ;;
+            single) usage=\$((out_b * 2)) ;;
+            *) usage=\$(( (in_b + out_b) * 2 )) ;;
+        esac
+        local pct=\$((usage * 100 / limit_bytes))
+
+        local reset_day cycle
+        reset_day=\$(jq -r ".ports.\\"\$port\\".quota.reset_day // 1" "\$CONFIG_FILE")
+        cycle=\$(cycle_start "\$reset_day")
+
+        local block_threshold=\$((limit_bytes * 95 / 100))
+        if [ "\$usage" -ge "\$block_threshold" ]; then
+            local last
+            last=\$(jq -r ".ports.\\"\$port\\".last_quota_block_notify_cycle // \\"\\"" "\$CONFIG_FILE")
+            if [ "\$last" != "\$cycle" ]; then
+                log "[配额封锁] 端口 \$port 本周期流量已用 \${pct}%，已通知封锁"
+                if send_email "【流量超限】端口 \$port 已被暂停" "<p>端口 \$port 本月流量配额已用完 (\${pct}%)，已被暂停服务。</p>" "\$user_email"; then
+                    update_json ".ports.\\"\$port\\".last_quota_block_notify_cycle = \\"\$cycle\\""
+                fi
+            fi
+        elif [ "\$pct" -ge 80 ]; then
+            local last
+            last=\$(jq -r ".ports.\\"\$port\\".last_quota_warning_cycle // \\"\\"" "\$CONFIG_FILE")
+            if [ "\$last" != "\$cycle" ]; then
+                log "[配额预警] 端口 \$port 本周期流量已用 \${pct}%"
+                if send_email "【流量预警】端口 \$port 配额即将用完" "<p>端口 \$port 本月流量配额已使用 \${pct}%。</p>" "\$user_email"; then
+                    update_json ".ports.\\"\$port\\".last_quota_warning_cycle = \\"\$cycle\\""
+                fi
             fi
         fi
     done
 }
 
+cycle_start() {
+    local reset_day=\$1
+    local today_day year month cur_last cur_eff
+    today_day=\$(TZ='Asia/Shanghai' date +%d | sed 's/^0//')
+    year=\$(TZ='Asia/Shanghai' date +%Y)
+    month=\$(TZ='Asia/Shanghai' date +%m)
+    cur_last=\$(date -d "\$year-\$month-01 +1 month -1 day" +%-d 2>/dev/null || echo 28)
+    cur_eff=\$reset_day
+    [ "\$reset_day" -gt "\$cur_last" ] && cur_eff=\$cur_last
+    if [ "\$today_day" -ge "\$cur_eff" ]; then
+        printf "%s-%s-%02d" "\$year" "\$month" "\$cur_eff"
+    else
+        if [ "\$month" = "01" ]; then month="12"; year=\$((year - 1)); else month=\$(printf "%02d" \$((10#\$month - 1))); fi
+        local prev_last=\$(date -d "\$year-\$month-01 +1 month -1 day" +%-d 2>/dev/null || echo 28)
+        local prev_eff=\$reset_day
+        [ "\$reset_day" -gt "\$prev_last" ] && prev_eff=\$prev_last
+        printf "%s-%s-%02d" "\$year" "\$month" "\$prev_eff"
+    fi
+}
+
+# 落盘当前所有端口的流量计数快照，供开机恢复脚本在 nftables 表被清空后回填历史值使用
+# （没有这一步的话，reboot 后计数器只能从0开始，本次修复的开机恢复脚本会读取此文件补种历史值）
+save_snapshot() {
+    [ -f "\$CONFIG_FILE" ] || return 0
+    local tmp="\${SNAPSHOT_FILE}.tmp"
+    echo '{}' > "\$tmp"
+    for port in \$(jq -r '.ports | keys[]' "\$CONFIG_FILE" 2>/dev/null); do
+        local psafe in_b out_b
+        psafe=\$(echo "\$port" | tr ',-' '__')
+        in_b=\$(nft list counter \$FAMILY \$TABLE_NAME "port_\${psafe}_in" 2>/dev/null | grep -o 'bytes [0-9]*' | awk '{print \$2}')
+        out_b=\$(nft list counter \$FAMILY \$TABLE_NAME "port_\${psafe}_out" 2>/dev/null | grep -o 'bytes [0-9]*' | awk '{print \$2}')
+        in_b=\${in_b:-0}; out_b=\${out_b:-0}
+        jq --arg p "\$port" --argjson i "\$in_b" --argjson o "\$out_b" '.[\$p] = {input:\$i, output:\$o}' "\$tmp" > "\${tmp}.2" 2>/dev/null && mv "\${tmp}.2" "\$tmp"
+    done
+    mv "\$tmp" "\$SNAPSHOT_FILE"
+}
+
 if command -v flock >/dev/null 2>&1; then
-    ( flock -n 9 || exit 0; check_all ) 9>"\$LOCK_FILE"
+    ( flock -n 9 || exit 0; check_all; check_quota; save_snapshot ) 9>"\$LOCK_FILE"
 else
-    check_all
+    check_all; check_quota; save_snapshot
 fi
 PTMDAILYEOF
     chmod +x "$PTM_DAILY_SCRIPT"
@@ -24098,6 +24322,210 @@ fi
 PTMRESETEOF
     chmod +x "$PTM_RESET_SCRIPT"
 
+    # 开机恢复脚本：重启后 nftables 表是内存态会被清空，必须在开机时重建规则/配额/限速，
+    # 并按到期日重新判定应该放行还是封锁（避免"重启后过期端口变回可放行"的窗口期）
+    cat > "$PTM_BOOT_RESTORE_SCRIPT" <<PTMBOOTEOF
+#!/bin/bash
+# ptm 开机恢复 wrapper（由 net-tcp-tune 自动生成，请勿手动修改）
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CONFIG_FILE="${PTM_CONFIG_FILE}"
+TABLE_NAME="${PTM_TABLE_NAME}"
+FAMILY="${PTM_TABLE_FAMILY}"
+LOG_FILE="${PTM_NOTIFICATION_LOG}"
+SNAPSHOT_FILE="${PTM_TRAFFIC_SNAPSHOT}"
+
+log() { mkdir -p "\$(dirname "\$LOG_FILE")"; echo "[\$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
+
+[ -f "\$CONFIG_FILE" ] || exit 0
+
+# 开机时网络/内核模块可能还没就绪，等到 nft/jq 都可用再继续（最多等30秒）
+for i in \$(seq 1 30); do
+    command -v nft >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && break
+    sleep 1
+done
+
+nft add table \$FAMILY \$TABLE_NAME 2>/dev/null || true
+nft add chain \$FAMILY \$TABLE_NAME input '{ type filter hook input priority 0; }' 2>/dev/null || true
+nft add chain \$FAMILY \$TABLE_NAME output '{ type filter hook output priority 0; }' 2>/dev/null || true
+nft add chain \$FAMILY \$TABLE_NAME forward '{ type filter hook forward priority 0; }' 2>/dev/null || true
+nft add chain \$FAMILY \$TABLE_NAME prerouting '{ type filter hook prerouting priority -150; }' 2>/dev/null || true
+
+iface=\$(ip route | grep default | awk '{print \$5}' | head -n1)
+
+group_ports() {
+    local key="\$1"
+    if [[ "\$key" =~ , ]] && ! [[ "\$key" =~ ^[0-9]+-[0-9]+\$ ]]; then
+        echo "\$key" | tr ',' ' '
+    elif [[ "\$key" =~ ^[0-9]+-[0-9]+\$ ]]; then
+        seq "\${key%-*}" "\${key#*-}"
+    else
+        echo "\$key"
+    fi
+}
+
+today_epoch=\$(date -d "\$(TZ='Asia/Shanghai' date +%Y-%m-%d)" +%s 2>/dev/null || echo 0)
+restored=0
+blocked=0
+
+for port in \$(jq -r '.ports | keys[]' "\$CONFIG_FILE" 2>/dev/null); do
+    psafe=\$(echo "\$port" | tr ',-' '__')
+    expire=\$(jq -r ".ports.\\"\$port\\".expiration_date // \\"\\"" "\$CONFIG_FILE")
+    is_expired=false
+    if [ -n "\$expire" ] && [ "\$expire" != "null" ]; then
+        expire_epoch=\$(date -d "\$expire" +%s 2>/dev/null || echo 0)
+        [ "\$expire_epoch" -gt 0 ] && [ "\$today_epoch" -gt "\$expire_epoch" ] && is_expired=true
+    fi
+
+    if [ "\$is_expired" = true ]; then
+        nft delete quota \$FAMILY \$TABLE_NAME "port_\${psafe}_block_quota" 2>/dev/null || true
+        nft add quota \$FAMILY \$TABLE_NAME "port_\${psafe}_block_quota" { over 0 bytes\; } 2>/dev/null || true
+        for p in \$(group_ports "\$port"); do
+            for chain in input forward prerouting; do
+                nft insert rule \$FAMILY \$TABLE_NAME \$chain tcp dport \$p quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
+                nft insert rule \$FAMILY \$TABLE_NAME \$chain udp dport \$p quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
+            done
+            for chain in output forward; do
+                nft insert rule \$FAMILY \$TABLE_NAME \$chain tcp sport \$p quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
+                nft insert rule \$FAMILY \$TABLE_NAME \$chain udp sport \$p quota name "port_\${psafe}_block_quota" drop 2>/dev/null || true
+            done
+        done
+        blocked=\$((blocked + 1))
+        continue
+    fi
+
+    snap_in=0; snap_out=0
+    if [ -f "\$SNAPSHOT_FILE" ]; then
+        snap_in=\$(jq -r --arg p "\$port" '.[\$p].input // 0' "\$SNAPSHOT_FILE" 2>/dev/null)
+        snap_out=\$(jq -r --arg p "\$port" '.[\$p].output // 0' "\$SNAPSHOT_FILE" 2>/dev/null)
+        [[ "\$snap_in" =~ ^[0-9]+\$ ]] || snap_in=0
+        [[ "\$snap_out" =~ ^[0-9]+\$ ]] || snap_out=0
+    fi
+    nft delete counter \$FAMILY \$TABLE_NAME "port_\${psafe}_in" 2>/dev/null || true
+    nft delete counter \$FAMILY \$TABLE_NAME "port_\${psafe}_out" 2>/dev/null || true
+    nft add counter \$FAMILY \$TABLE_NAME "port_\${psafe}_in" "{ packets 0 bytes \$snap_in }" 2>/dev/null || true
+    nft add counter \$FAMILY \$TABLE_NAME "port_\${psafe}_out" "{ packets 0 bytes \$snap_out }" 2>/dev/null || true
+
+    for p in \$(group_ports "\$port"); do
+        nft add rule \$FAMILY \$TABLE_NAME input tcp dport \$p counter name "port_\${psafe}_in" 2>/dev/null || true
+        nft add rule \$FAMILY \$TABLE_NAME input udp dport \$p counter name "port_\${psafe}_in" 2>/dev/null || true
+        nft add rule \$FAMILY \$TABLE_NAME forward tcp dport \$p counter name "port_\${psafe}_in" 2>/dev/null || true
+        nft add rule \$FAMILY \$TABLE_NAME forward udp dport \$p counter name "port_\${psafe}_in" 2>/dev/null || true
+        nft add rule \$FAMILY \$TABLE_NAME output tcp sport \$p counter name "port_\${psafe}_out" 2>/dev/null || true
+        nft add rule \$FAMILY \$TABLE_NAME output udp sport \$p counter name "port_\${psafe}_out" 2>/dev/null || true
+        nft add rule \$FAMILY \$TABLE_NAME forward tcp sport \$p counter name "port_\${psafe}_out" 2>/dev/null || true
+        nft add rule \$FAMILY \$TABLE_NAME forward udp sport \$p counter name "port_\${psafe}_out" 2>/dev/null || true
+    done
+
+    limit=\$(jq -r ".ports.\\"\$port\\".quota.monthly_limit // \\"unlimited\\"" "\$CONFIG_FILE")
+    mode=\$(jq -r ".ports.\\"\$port\\".billing_mode // \\"double\\"" "\$CONFIG_FILE")
+    if [ "\$limit" != "unlimited" ]; then
+        number=\$(echo "\$limit" | grep -o '^[0-9]\\+')
+        unit=\$(echo "\$limit" | grep -o '[A-Za-z]\\+\$' | tr '[:lower:]' '[:upper:]')
+        case "\$unit" in
+            MB|M) quota_bytes=\$((number * 1048576)) ;;
+            GB|G) quota_bytes=\$((number * 1073741824)) ;;
+            TB|T) quota_bytes=\$((number * 1099511627776)) ;;
+            *) quota_bytes=0 ;;
+        esac
+        case "\$mode" in
+            premium) used=\$((snap_in + snap_out)) ;;
+            single) used=\$((snap_out * 2)) ;;
+            *) used=\$(( (snap_in + snap_out) * 2 )) ;;
+        esac
+        quota_name="port_\${psafe}_quota"
+        nft delete quota \$FAMILY \$TABLE_NAME "\$quota_name" 2>/dev/null || true
+        nft add quota \$FAMILY \$TABLE_NAME "\$quota_name" { over \$quota_bytes bytes used \$used bytes\; } 2>/dev/null || true
+        for p in \$(group_ports "\$port"); do
+            case "\$mode" in
+                single)
+                    nft insert rule \$FAMILY \$TABLE_NAME output tcp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME output udp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME forward tcp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME forward udp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    ;;
+                premium)
+                    nft insert rule \$FAMILY \$TABLE_NAME input tcp dport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME input udp dport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME forward tcp dport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME forward udp dport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME output tcp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME output udp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME forward tcp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME forward udp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    ;;
+                *)
+                    nft insert rule \$FAMILY \$TABLE_NAME input tcp dport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME input udp dport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME forward tcp dport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME forward udp dport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME output tcp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME output udp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME forward tcp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    nft insert rule \$FAMILY \$TABLE_NAME forward udp sport \$p quota name "\$quota_name" drop 2>/dev/null || true
+                    ;;
+            esac
+        done
+    fi
+
+    if [ -n "\$iface" ]; then
+        rate_enabled=\$(jq -r ".ports.\\"\$port\\".bandwidth_limit.enabled // false" "\$CONFIG_FILE")
+        if [ "\$rate_enabled" = "true" ]; then
+            rate=\$(jq -r ".ports.\\"\$port\\".bandwidth_limit.rate // \\"\\"" "\$CONFIG_FILE")
+            if [ -n "\$rate" ] && [ "\$rate" != "unlimited" ]; then
+                lower=\$(echo "\$rate" | tr '[:upper:]' '[:lower:]')
+                tc_rate=""
+                [[ "\$lower" =~ kbps\$ ]] && tc_rate="\${lower%kbps}kbit"
+                [[ "\$lower" =~ mbps\$ ]] && tc_rate="\${lower%mbps}mbit"
+                [[ "\$lower" =~ gbps\$ ]] && tc_rate="\${lower%gbps}gbit"
+                if [ -n "\$tc_rate" ]; then
+                    tc qdisc add dev "\$iface" root handle 1: htb default 30 2>/dev/null || true
+                    tc class add dev "\$iface" parent 1: classid 1:1 htb rate 1000mbit 2>/dev/null || true
+                    if [[ "\$port" =~ , ]] || [[ "\$port" =~ ^[0-9]+-[0-9]+\$ ]]; then
+                        mark_id=\$(( \$(echo -n "\$psafe" | cksum | cut -d' ' -f1) % 65000 + 1000 ))
+                        class_id="1:\$(printf '%x' \$((0x2000 + (mark_id % 4096))))"
+                    else
+                        class_id="1:\$(printf '%x' \$((0x1000 + port)))"
+                    fi
+                    tc class del dev "\$iface" classid "\$class_id" 2>/dev/null || true
+                    tc class add dev "\$iface" parent 1:1 classid "\$class_id" htb rate "\$tc_rate" ceil "\$tc_rate" 2>/dev/null || true
+                    if [[ "\$port" =~ , ]] || [[ "\$port" =~ ^[0-9]+-[0-9]+\$ ]]; then
+                        tc filter add dev "\$iface" protocol ip parent 1:0 prio 1 handle "\$mark_id" fw flowid "\$class_id" 2>/dev/null || true
+                    else
+                        fprio=\$((port % 1000 + 1))
+                        tc filter add dev "\$iface" protocol ip parent 1:0 prio "\$fprio" u32 match ip protocol 6 0xff match ip sport "\$port" 0xffff flowid "\$class_id" 2>/dev/null || true
+                        tc filter add dev "\$iface" protocol ip parent 1:0 prio "\$fprio" u32 match ip protocol 6 0xff match ip dport "\$port" 0xffff flowid "\$class_id" 2>/dev/null || true
+                        tc filter add dev "\$iface" protocol ip parent 1:0 prio \$((fprio + 1000)) u32 match ip protocol 17 0xff match ip sport "\$port" 0xffff flowid "\$class_id" 2>/dev/null || true
+                        tc filter add dev "\$iface" protocol ip parent 1:0 prio \$((fprio + 1000)) u32 match ip protocol 17 0xff match ip dport "\$port" 0xffff flowid "\$class_id" 2>/dev/null || true
+                    fi
+                fi
+            fi
+        fi
+    fi
+    restored=\$((restored + 1))
+done
+
+log "[开机恢复] 已重建 \$restored 个正常端口规则，\$blocked 个到期端口已重新封锁"
+PTMBOOTEOF
+    chmod +x "$PTM_BOOT_RESTORE_SCRIPT"
+
+    cat > "$PTM_BOOT_RESTORE_SERVICE" <<PTMSVCEOF
+[Unit]
+Description=ptm 端口流量监控 - 开机恢复 nftables 规则/配额/限速
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${PTM_BOOT_RESTORE_SCRIPT}
+
+[Install]
+WantedBy=multi-user.target
+PTMSVCEOF
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable ptm-boot-restore.service >/dev/null 2>&1 || true
+    fi
+
     local daily_h daily_m reset_h reset_m tmp_cron
     read -r daily_h daily_m < <(snell_bj_to_local_time 00 10)
     read -r reset_h reset_m < <(snell_bj_to_local_time 00 20)
@@ -24106,7 +24534,7 @@ PTMRESETEOF
     echo "${daily_m} ${daily_h} * * * ${PTM_DAILY_SCRIPT} >/dev/null 2>&1  # ptm每日检查" >> "$tmp_cron"
     echo "${reset_m} ${reset_h} * * * ${PTM_RESET_SCRIPT} >/dev/null 2>&1  # ptm每日重置" >> "$tmp_cron"
     crontab "$tmp_cron" 2>/dev/null && rm -f "$tmp_cron"
-    echo -e "${gl_lv}✓ 已注册每日北京时间 00:10(到期/配额检查) 与 00:20(计费周期重置) 定时任务${gl_bai}"
+    echo -e "${gl_lv}✓ 已注册每日北京时间 00:10(到期/配额检查) 与 00:20(计费周期重置) 定时任务，及开机自动恢复规则的 systemd 服务${gl_bai}"
 }
 
 ptm_remove_cron() {
@@ -24116,7 +24544,11 @@ ptm_remove_cron() {
         crontab -l 2>/dev/null | grep -v "# ptm每日检查" | grep -v "# ptm每日重置" > "$tmp_cron" || true
         crontab "$tmp_cron" 2>/dev/null && rm -f "$tmp_cron"
     fi
-    rm -f "$PTM_DAILY_SCRIPT" "$PTM_RESET_SCRIPT"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable ptm-boot-restore.service >/dev/null 2>&1 || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    rm -f "$PTM_DAILY_SCRIPT" "$PTM_RESET_SCRIPT" "$PTM_BOOT_RESTORE_SCRIPT" "$PTM_BOOT_RESTORE_SERVICE" "$PTM_TRAFFIC_SNAPSHOT"
 }
 
 # ---- 交互菜单 ----
@@ -24261,12 +24693,6 @@ ptm_render_port_table() {
         usage=$(ptm_format_bytes "$(ptm_get_port_monthly_usage "$port")")
         printf "%-20s %-10s %-10s %-16s %-18s %s\n" "$port" "$billing_mode" "$status" "$usage" "$quota_limit" "$expire_date"
     done
-}
-
-ptm_menu_list_ports() {
-    ptm_init_config
-    ptm_render_port_table
-    break_end
 }
 
 ptm_do_renew_months() {
@@ -24687,6 +25113,11 @@ ptm_menu_diagnose() {
         echo -e "${gl_lv}✅ 每日重置定时任务已注册${gl_bai}"
     else
         echo -e "${gl_huang}⚠️ 每日重置定时任务未注册（新增一个端口即可自动注册）${gl_bai}"
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled ptm-boot-restore.service >/dev/null 2>&1; then
+        echo -e "${gl_lv}✅ 开机恢复服务已启用（重启后会自动重建规则/配额/限速）${gl_bai}"
+    else
+        echo -e "${gl_huang}⚠️ 开机恢复服务未启用，重启VPS后监控规则不会自动恢复（新增一个端口即可自动注册）${gl_bai}"
     fi
     local notify_enabled
     notify_enabled=$(jq -r '.notify.enabled // false' "$PTM_CONFIG_FILE")
