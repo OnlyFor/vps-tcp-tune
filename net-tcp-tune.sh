@@ -8,6 +8,9 @@
 # 1. 正式版本迭代时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 临时热修/不发版时只修改 SCRIPT_LAST_UPDATE，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.4.6 更新: 安全加固收尾——清理 v5.4.5 未覆盖的剩余3处可预测临时路径: ①sing-box安装临时目录改mktemp -d(700)；
+#   ②"禁止中国大陆直连"的IP列表下载改mktemp随机路径(600),不再用/tmp固定文件名；③cloudflared下载临时文件改mktemp随机后缀,
+#   三处均失败即终止；至此全脚本/tmp临时文件均为不可预测路径 (by Eric86777)
 # v5.4.5 更新: 安全加固3项——①菜单32-7 Responses转换代理新增访问密钥鉴权(部署时自动生成48位密钥,客户端需以 Authorization: Bearer 携带,
 #   常数时间比对,无密钥配置一律拒绝),移除CORS通配符,「修改配置」会同步重新生成proxy.mjs并为旧实例补发密钥(重启后生效)；
 #   ②Responses代理实例目录权限收紧为700、config.json为600(先收紧再写入)；③Xray官方安装脚本与星辰大海Xray的/tmp临时文件
@@ -24,10 +27,9 @@
 # v5.4.2 更新: 菜单33「快速开通端口」重做为与私有dog原版一致的多步向导(端口→计费模式→配额→备注→重置日→租期→邮箱)，
 #   恢复"合并端口为组"功能；配额/带宽输入改为dog原版的"0=无限制"约定(单位MB/GB/T、Kbps/Mbps/Gbps)；
 #   修正计费模式选项编号(2=仅出站 3=CN Premium，此前编号反了)；带宽/配额/租期管理改为按序号多选端口 (by Eric86777)
-# v5.4.1 更新: 菜单33「端口流量计费与到期管理」菜单结构改为对齐 dog 原版分组(1添加/删除 2限制设置[带宽/配额/租期] 3重置管理[重置日/立即重置] 4通知 5诊断 99卸载)；修复主菜单0端口时状态栏"守护端口"数字重复显示的问题 (by Eric86777)
 
-SCRIPT_VERSION="5.4.5"
-SCRIPT_LAST_UPDATE="安全加固:Responses代理访问鉴权+实例配置权限收紧;Xray临时文件改用mktemp"
+SCRIPT_VERSION="5.4.6"
+SCRIPT_LAST_UPDATE="安全加固收尾:sing-box/中国IP列表/cloudflared临时文件全部改用mktemp"
 #=============================================================================
 
 #=============================================================================
@@ -12778,6 +12780,17 @@ update_china_ipset() {
         return 1
     fi
 
+    # 安全：改用 mktemp 随机路径(600)替代 /tmp 固定文件名，避免符号链接抢占/内容污染；
+    # 用 local 覆盖全局同名变量，download_china_ip_list 经动态作用域读到的即本次路径
+    local CN_IP_LIST_FILE
+    CN_IP_LIST_FILE=$(mktemp /tmp/china-ip-list-XXXXXX.txt) || {
+        echo -e "${gl_hong}❌ 创建临时文件失败${gl_bai}"
+        flock -u 200
+        rm -f "$lock_file"
+        return 1
+    }
+    chmod 600 "$CN_IP_LIST_FILE"
+
     # 确保退出时释放锁和清理临时文件
     # shellcheck disable=SC2064  # 故意立即展开：EXIT 触发时局部变量可能已出作用域
     trap "flock -u 200; rm -f '$lock_file' '$CN_IP_LIST_FILE'" EXIT ERR
@@ -14307,9 +14320,13 @@ install_singbox_binary() {
             echo -e "${gl_zi}[3/5] 下载 sing-box v${version} (${arch})...${gl_bai}"
             
             local download_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${arch}.tar.gz"
-            local temp_dir="/tmp/singbox-install-$$"
-            
-            mkdir -p "$temp_dir"
+            # 安全：使用 mktemp -d 生成不可预测的临时目录(700)，避免符号链接攻击
+            local temp_dir
+            temp_dir=$(mktemp -d /tmp/singbox-install-XXXXXX) || {
+                echo -e "${gl_hong}  ✗ 创建临时目录失败${gl_bai}"
+                break_end
+                return 1
+            }
             
             if ! wget --timeout=30 --tries=3 -qO "${temp_dir}/sing-box.tar.gz" "$download_url" 2>/dev/null; then
                 echo -e "${gl_hong}  ✗ 下载失败${gl_bai}"
@@ -15876,9 +15893,14 @@ cf_helper_install_binary() {
     local url="https://github.com/cloudflare/cloudflared/releases/latest/download/${asset}"
     echo "正在下载 cloudflared (${asset})..."
 
-    local tmp="${CF_BINARY_PATH}.tmp.$$"
+    # 安全：mktemp 随机后缀替代 PID 后缀；chmod 755 显式保持与原先 umask 结果一致
+    local tmp
+    tmp=$(mktemp "${CF_BINARY_PATH}.tmp.XXXXXX") || {
+        echo -e "${gl_hong}❌ 创建临时文件失败${gl_bai}"
+        return 1
+    }
     if wget -q --show-progress -O "$tmp" "$url" && [ -s "$tmp" ]; then
-        chmod +x "$tmp"
+        chmod 755 "$tmp"
         mv "$tmp" "$CF_BINARY_PATH"
         local ver
         ver=$("$CF_BINARY_PATH" --version 2>/dev/null | head -1)
