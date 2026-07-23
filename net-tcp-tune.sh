@@ -10537,7 +10537,13 @@ run_xinchendahai_xray() {
     echo ""
 
     # 创建临时脚本
-    local script_path="/tmp/xinchendahai_xray_$$.sh"
+    # 安全：使用 mktemp 生成不可预测的临时文件名，避免符号链接攻击
+    local script_path
+    script_path=$(mktemp /tmp/xinchendahai_xray_XXXXXX.sh) || {
+        echo -e "${gl_hong}❌ 创建临时文件失败${gl_bai}"
+        return 1
+    }
+    chmod 600 "$script_path"
 
     echo "正在准备星辰大海Xray增强版脚本..."
 
@@ -10896,7 +10902,7 @@ write_config() {
 execute_official_script() {
     local args="$1"
     local script_content
-    local temp_script="/tmp/xray_install_$$.sh"
+    local temp_script
 
     # 下载官方安装脚本
     if ! script_content=$(curl -fsSL --max-time 30 "$xray_install_script_url" 2>/dev/null); then
@@ -10909,6 +10915,13 @@ execute_official_script() {
         error "Xray 官方安装脚本内容异常！"
         return 1
     fi
+
+    # 安全：使用 mktemp 生成不可预测的临时文件名，避免符号链接攻击
+    temp_script=$(mktemp /tmp/xray_install_XXXXXX.sh) || {
+        error "创建临时文件失败！"
+        return 1
+    }
+    chmod 600 "$temp_script"
 
     # 写入临时文件并执行
     echo "$script_content" > "$temp_script"
